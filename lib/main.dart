@@ -67,10 +67,10 @@ const markets = <Market>[
   Market('USD/SGD', 'USD/SGD', 'Exotic'),
 ];
 
-// ───────────────── CANDLE + ENGINE ─────────────────
+// ───────────────── CANDLE ─────────────────
 class Candle {
   final double o, h, l, c;
-  final String time; // raw "datetime" string from TwelveData, e.g. "2026-09-05 01:16:00"
+  final String time; // raw "datetime" string from TwelveData
   Candle(this.o, this.h, this.l, this.c, this.time);
   factory Candle.fromJson(Map<String, dynamic> j) => Candle(
         double.parse(j['open'].toString()),
@@ -81,14 +81,15 @@ class Candle {
       );
 }
 
-/// Pure technical-engine output. No grade/direction/color here anymore —
-/// those are decided later by [buildFinalSignal] using engine + AI together,
-/// which is what fixes the "PUT never gets A+" bug.
+/// Pure technical-engine output — 11 indicators, ported 1:1 from the web
+/// app's signalEngine.js (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21,
+/// EMA21/50, RSI, Bollinger, MACD, Stochastic, Pattern). No grade/direction
+/// here — [buildFinalSignal] decides that from engine + Gemini together.
 class Signal {
-  final int strength; // 0-100, 50 = neutral, >50 leans bullish, <50 bearish
-  final int techConfidence; // 0-100, how much the indicators agree with each other
-  final Map<String, String> breakdown; // kept for AI prompt / debugging, not shown in overlay UI anymore
-  final Map<String, double> indicators; // raw numeric values, used for the Gemini prompt
+  final double strength; // 0-100, 50 = neutral, >50 leans bullish, <50 bearish
+  final int techConfidence; // 0-100, how much the 11 indicators agree with each other
+  final Map<String, String> breakdown; // every indicator's own BULL/BEAR/NEUTRAL vote
+  final Map<String, double> indicators; // every raw numeric value, sent to Gemini in full
   Signal({
     required this.strength,
     required this.techConfidence,
@@ -98,6 +99,7 @@ class Signal {
 }
 
 /// Final, user-facing decision after combining the technical engine with Gemini.
+/// direction/grade/accuracy are ALWAYS resolved to a real CALL or PUT — never null.
 class FinalSignal {
   final String grade; // A+, A, B+, B, C — same scale for CALL and PUT
   final String direction; // 'CALL' or 'PUT'
@@ -112,6 +114,10 @@ class FinalSignal {
     required this.reason,
   });
 }
+
+// ══════════════════════════════════════════════════════════
+//   CORE MATH HELPERS
+// ══════════════════════════════════════════════════════════
 
 double? ema(List<double> a, int p) {
   if (a.length < p) return null;
@@ -168,6 +174,178 @@ double? stoch(List<Candle> cs, [int p = 14]) {
   return ((cs.last.c - ll) / (hh - ll)) * 100;
 }
 
+/// 3-candle pattern read (engulfing / pin bar / reversal / 3-in-a-row).
+/// Returns -2..2. Ported 1:1 from the web app's patternScore().
+int patternScore(List<Candle> candles) {
+  if (candles.length < 3) return 0;
+  final last3 = candles.sublist(candles.length - 3);
+  final c2 = last3[0], c1 = last3[1], c0 = last3[2]; // oldest -> newest
+  bool bull(Candle c) => c.c > c.o;
+  double body(Candle c) => (c.c - c.o).abs();
+  final c0body = body(c0), c1body = body(c1), c2body = body(c2);
+  final lw = min(c0.o, c0.c) - c0.l;
+  final uw = c0.h - max(c0.o, c0.c);
+
+  if (bull(c0) && !bull(c1) && c0.o <= c1.c && c0.c >= c1.o && c0body > c1body) return 2;
+  if (!bull(c0) && bull(c1) && c0.o >= c1.c && c0.c <= c1.o && c0body > c1body) return -2;
+  if (lw > c0body * 2 && uw < c0body * 0.3) return 1;
+  if (uw > c0body * 2 && lw < c0body * 0.3) return -1;
+  if (!bull(c2) && c1body < c2body * 0.3 && bull(c0) && c0.c > (c2.o + c2.c) / 2) return 2;
+  if (bull(c2) && c1body < c2body * 0.3 && !bull(c0) && c0.c < (c2.o + c2.c) / 2) return -2;
+  if (bull(c2) && bull(c1) && bull(c0)) return 1;
+  if (!bull(c2) && !bull(c1) && !bull(c0)) return -1;
+  return 0;
+}
+
+// ══════════════════════════════════════════════════════════
+//   TOP-TIER INDICATORS (ADX, Supertrend, Ichimoku, Fractal2)
+//   Ported 1:1 from the web app's signalEngine.js
+// ══════════════════════════════════════════════════════════
+
+Map<String, double>? calcADX(List<Candle> candles, [int p = 14]) {
+  if (candles.length < p * 2 + 1) return null;
+  final highs = candles.map((c) => c.h).toList();
+  final lows = candles.map((c) => c.l).toList();
+  final closes = candles.map((c) => c.c).toList();
+
+  final plusDM = <double>[], minusDM = <double>[], trs = <double>[];
+  for (var i = 1; i < candles.length; i++) {
+    final upMove = highs[i] - highs[i - 1];
+    final downMove = lows[i - 1] - lows[i];
+    plusDM.add(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.add(downMove > upMove && downMove > 0 ? downMove : 0);
+    trs.add([
+      highs[i] - lows[i],
+      (highs[i] - closes[i - 1]).abs(),
+      (lows[i] - closes[i - 1]).abs(),
+    ].reduce(max));
+  }
+
+  List<double> wilderSmooth(List<double> arr, int period) {
+    final out = <double>[arr.sublist(0, period).reduce((a, b) => a + b)];
+    for (var i = period; i < arr.length; i++) {
+      out.add(out.last - out.last / period + arr[i]);
+    }
+    return out;
+  }
+
+  final sTR = wilderSmooth(trs, p);
+  final sPlus = wilderSmooth(plusDM, p);
+  final sMinus = wilderSmooth(minusDM, p);
+
+  final plusDI = <double>[], minusDI = <double>[];
+  for (var i = 0; i < sPlus.length; i++) {
+    final trv = sTR[i] == 0 ? 1 : sTR[i];
+    plusDI.add(100 * sPlus[i] / trv);
+    minusDI.add(100 * sMinus[i] / trv);
+  }
+  final dx = <double>[];
+  for (var i = 0; i < plusDI.length; i++) {
+    final denom = (plusDI[i] + minusDI[i]) == 0 ? 1 : (plusDI[i] + minusDI[i]);
+    dx.add(100 * (plusDI[i] - minusDI[i]).abs() / denom);
+  }
+
+  if (dx.length < p) return null;
+  var adxVal = dx.sublist(0, p).reduce((a, b) => a + b) / p;
+  for (var i = p; i < dx.length; i++) {
+    adxVal = (adxVal * (p - 1) + dx[i]) / p;
+  }
+  return {'adx': adxVal, 'plusDI': plusDI.last, 'minusDI': minusDI.last};
+}
+
+Map<String, double>? calcSupertrend(List<Candle> candles, [int period = 10, double mult = 3]) {
+  if (candles.length < period + 2) return null;
+  final highs = candles.map((c) => c.h).toList();
+  final lows = candles.map((c) => c.l).toList();
+  final closes = candles.map((c) => c.c).toList();
+
+  final trs = <double>[];
+  for (var i = 1; i < candles.length; i++) {
+    trs.add([
+      highs[i] - lows[i],
+      (highs[i] - closes[i - 1]).abs(),
+      (lows[i] - closes[i - 1]).abs(),
+    ].reduce(max));
+  }
+  var atrVal = trs.sublist(0, period).reduce((a, b) => a + b) / period;
+  final atrSeries = <double>[atrVal];
+  for (var i = period; i < trs.length; i++) {
+    atrVal = (atrVal * (period - 1) + trs[i]) / period;
+    atrSeries.add(atrVal);
+  }
+
+  var trend = 1;
+  var finalUpper = 0.0, finalLower = 0.0;
+  final offset = candles.length - atrSeries.length;
+  for (var i = 0; i < atrSeries.length; i++) {
+    final idx = i + offset;
+    final hl2 = (highs[idx] + lows[idx]) / 2;
+    final bUpper = hl2 + mult * atrSeries[i];
+    final bLower = hl2 - mult * atrSeries[i];
+    if (i == 0) {
+      finalUpper = bUpper;
+      finalLower = bLower;
+      continue;
+    }
+    final prevClose = closes[idx - 1];
+    finalUpper = (bUpper < finalUpper || prevClose > finalUpper) ? bUpper : finalUpper;
+    finalLower = (bLower > finalLower || prevClose < finalLower) ? bLower : finalLower;
+    if (trend == 1 && closes[idx] < finalLower) trend = -1;
+    else if (trend == -1 && closes[idx] > finalUpper) trend = 1;
+  }
+  return {'trend': trend.toDouble(), 'value': trend == 1 ? finalLower : finalUpper};
+}
+
+Map<String, double>? calcIchimoku(List<Candle> candles) {
+  if (candles.length < 52) return null;
+  final highs = candles.map((c) => c.h).toList();
+  final lows = candles.map((c) => c.l).toList();
+  final close = candles.last.c;
+  double periodHL(int p) {
+    final hs = highs.sublist(highs.length - p);
+    final ls = lows.sublist(lows.length - p);
+    return (hs.reduce(max) + ls.reduce(min)) / 2;
+  }
+  final tenkan = periodHL(9);
+  final kijun = periodHL(26);
+  final spanA = (tenkan + kijun) / 2;
+  final spanB = periodHL(52);
+  final aboveCloud = close > max(spanA, spanB);
+  final belowCloud = close < min(spanA, spanB);
+  final tkCross = tenkan > kijun ? 1.0 : (tenkan < kijun ? -1.0 : 0.0);
+  return {
+    'tenkan': tenkan,
+    'kijun': kijun,
+    'spanA': spanA,
+    'spanB': spanB,
+    'aboveCloud': aboveCloud ? 1 : 0,
+    'belowCloud': belowCloud ? 1 : 0,
+    'tkCross': tkCross,
+  };
+}
+
+/// Confirmed-only Williams 5-bar fractal (n=2 each side) — never repaints.
+/// Returns {'type': 1=low(bull)/-1=high(bear), 'age': candles since confirmed}.
+Map<String, double>? calcFractal2(List<Candle> candles, [int n = 2]) {
+  if (candles.length < n * 2 + 1) return null;
+  final highs = candles.map((c) => c.h).toList();
+  final lows = candles.map((c) => c.l).toList();
+  final idx = candles.length - 1 - n;
+  if (idx < n) return null;
+  var isHigh = true, isLow = true;
+  for (var i = 1; i <= n; i++) {
+    if (!(highs[idx] > highs[idx - i] && highs[idx] > highs[idx + i])) isHigh = false;
+    if (!(lows[idx] < lows[idx - i] && lows[idx] < lows[idx + i])) isLow = false;
+  }
+  final age = candles.length - 1 - (idx + n);
+  if (isHigh) return {'type': -1, 'age': age.toDouble()};
+  if (isLow) return {'type': 1, 'age': age.toDouble()};
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════
+//   MASTER SIGNAL ENGINE — all 11 indicators
+// ══════════════════════════════════════════════════════════
 Signal runEngine(List<Candle> candles) {
   final bd = <String, String>{};
   final ind = <String, double>{};
@@ -178,76 +356,232 @@ Signal runEngine(List<Candle> candles) {
   final closes = candles.map((e) => e.c).toList();
   final last = closes.last;
   ind['lastClose'] = last;
-  var score = 0;
-  var maxScore = 0;
+  double score = 0;
+  double maxScore = 0;
 
+  // 1. ADX + DI — weight 16
+  final ax = calcADX(candles, 14);
+  if (ax != null) {
+    double v;
+    if (ax['adx']! > 25) {
+      v = ax['plusDI']! > ax['minusDI']! ? 16 : -16;
+    } else if (ax['adx']! > 20) {
+      v = ax['plusDI']! > ax['minusDI']! ? 8 : -8;
+    } else {
+      v = ax['plusDI']! > ax['minusDI']! ? 4 : -4;
+    }
+    score += v;
+    maxScore += 16;
+    bd['ADX ${ax['adx']!.toStringAsFixed(0)}'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+    ind['adx'] = ax['adx']!;
+    ind['plusDI'] = ax['plusDI']!;
+    ind['minusDI'] = ax['minusDI']!;
+  } else {
+    bd['ADX'] = '→ NEUTRAL';
+  }
+
+  // 2. Supertrend — weight 16
+  final st2 = calcSupertrend(candles, 10, 3);
+  if (st2 != null) {
+    final v = st2['trend']! == 1 ? 16.0 : -16.0;
+    score += v;
+    maxScore += 16;
+    bd['Supertrend'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+    ind['supertrendTrend'] = st2['trend']!;
+    ind['supertrendValue'] = st2['value']!;
+  } else {
+    bd['Supertrend'] = '→ NEUTRAL';
+  }
+
+  // 3. Ichimoku Cloud — weight 16
+  final ich = calcIchimoku(candles);
+  if (ich != null) {
+    double v;
+    if (ich['aboveCloud'] == 1) {
+      v = 16;
+    } else if (ich['belowCloud'] == 1) {
+      v = -16;
+    } else if (ich['tkCross'] != 0) {
+      v = ich['tkCross']! * 4;
+    } else {
+      v = last >= ich['kijun']! ? 4 : -4;
+    }
+    score += v;
+    maxScore += 16;
+    bd['Ichimoku'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+    ind['ichiTenkan'] = ich['tenkan']!;
+    ind['ichiKijun'] = ich['kijun']!;
+    ind['ichiSpanA'] = ich['spanA']!;
+    ind['ichiSpanB'] = ich['spanB']!;
+    ind['ichiAboveCloud'] = ich['aboveCloud']!;
+    ind['ichiBelowCloud'] = ich['belowCloud']!;
+    ind['ichiTkCross'] = ich['tkCross']!;
+  } else {
+    bd['Ichimoku'] = '→ NEUTRAL';
+  }
+
+  // 4. Fractal 2 — weight 16, decays with age; falls back to 3-candle momentum
+  final fr = calcFractal2(candles, 2);
+  if (fr != null) {
+    final decay = max(0.0, 1 - fr['age']! * 0.15);
+    final v = fr['type']! == 1 ? 16 * decay : -16 * decay;
+    score += v;
+    maxScore += 16;
+    bd['Fractal 2'] = fr['type']! == 1 ? '↑ BULL (▲)' : '↓ BEAR (▼)';
+    ind['fractal2Type'] = fr['type']!;
+    ind['fractal2Age'] = fr['age']!;
+  } else {
+    final isBullMomentum = last > closes[max(0, closes.length - 4)];
+    final v = isBullMomentum ? 8.0 : -8.0; // fallback still actually votes, half weight
+    score += v;
+    maxScore += 16;
+    bd['Fractal 2'] = isBullMomentum ? '↑ BULL' : '↓ BEAR';
+    ind['fractal2Type'] = 0;
+  }
+
+  // 5. EMA 8/21 — weight up to 14, scaled by gap size
   final e8 = ema(closes, 8);
   final e21 = ema(closes, 21);
   if (e8 != null && e21 != null) {
-    final v = e8 > e21 ? 16 : -16;
+    final gap = ((e8 - e21) / e21).abs() * 100;
+    final w = min(14.0, gap * 250);
+    final v = e8 > e21 ? w : -w;
     score += v;
-    maxScore += 16;
+    maxScore += 14;
     bd['EMA 8/21'] = v > 0 ? '↑ BULL' : '↓ BEAR';
     ind['ema8'] = e8;
     ind['ema21'] = e21;
+  } else {
+    bd['EMA 8/21'] = '→ NEUTRAL';
   }
 
+  // 6. EMA 21/50 — weight 12
   final e50 = ema(closes, 50);
   if (e21 != null && e50 != null) {
-    final v = e21 > e50 ? 12 : -12;
+    final v = e21 > e50 ? 12.0 : -12.0;
     score += v;
     maxScore += 12;
     bd['EMA 21/50'] = v > 0 ? '↑ BULL' : '↓ BEAR';
     ind['ema50'] = e50;
+  } else {
+    bd['EMA 21/50'] = '→ NEUTRAL';
   }
 
-  final r = rsi(closes);
+  // 7. RSI — weight up to 14, graduated by zone
+  final r = rsi(closes, 14);
   if (r != null) {
-    final v = r < 35 ? 14 : (r > 65 ? -14 : (r >= 50 ? 3 : -3));
+    double v;
+    if (r < 25) {
+      v = 14;
+    } else if (r < 35) {
+      v = 9;
+    } else if (r < 45) {
+      v = 3;
+    } else if (r > 75) {
+      v = -14;
+    } else if (r > 65) {
+      v = -9;
+    } else if (r > 55) {
+      v = -3;
+    } else {
+      v = r >= 50 ? 1 : -1;
+    }
     score += v;
     maxScore += 14;
     bd['RSI ${r.toStringAsFixed(0)}'] = v > 0 ? '↑ BULL' : '↓ BEAR';
     ind['rsi'] = r;
+  } else {
+    bd['RSI'] = '→ NEUTRAL';
   }
 
-  final b = bb(closes);
+  // 8. Bollinger Bands — weight up to 12, graduated by %B
+  final b = bb(closes, 20);
   if (b != null) {
     final pct = (last - b['lower']!) / (b['upper']! - b['lower']!);
-    final v = pct < 0.2 ? 12 : (pct > 0.8 ? -12 : (pct >= 0.5 ? 2 : -2));
+    double v;
+    if (pct < 0.05) {
+      v = 12;
+    } else if (pct < 0.2) {
+      v = 7;
+    } else if (pct < 0.4) {
+      v = 3;
+    } else if (pct > 0.95) {
+      v = -12;
+    } else if (pct > 0.8) {
+      v = -7;
+    } else if (pct > 0.6) {
+      v = -3;
+    } else {
+      v = pct >= 0.5 ? 1 : -1;
+    }
     score += v;
     maxScore += 12;
     bd['Bollinger'] = v > 0 ? '↑ BULL' : '↓ BEAR';
     ind['bbUpper'] = b['upper']!;
     ind['bbMid'] = b['mid']!;
     ind['bbLower'] = b['lower']!;
+    ind['bbPct'] = pct;
+  } else {
+    bd['Bollinger'] = '→ NEUTRAL';
   }
 
+  // 9. MACD — weight 12 (7 from line-vs-signal, 5 from histogram sign)
   final m = macd(closes);
   if (m != null) {
-    final v = m['line']! > m['signal']! ? 12 : -12;
-    score += v;
+    final cv = m['line']! > m['signal']! ? 7.0 : -7.0;
+    final hv = m['hist']! > 0 ? 5.0 : -5.0;
+    score += cv + hv;
     maxScore += 12;
-    bd['MACD'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+    bd['MACD'] = (cv + hv) > 0 ? '↑ BULL' : '↓ BEAR';
     ind['macdLine'] = m['line']!;
     ind['macdSignal'] = m['signal']!;
+    ind['macdHist'] = m['hist']!;
+  } else {
+    bd['MACD'] = '→ NEUTRAL';
   }
 
-  final st = stoch(candles);
+  // 10. Stochastic — weight up to 10, graduated by zone
+  final st = stoch(candles, 14);
   if (st != null) {
-    final v = st < 30 ? 10 : (st > 70 ? -10 : (st >= 50 ? 2 : -2));
+    double v;
+    if (st < 20) {
+      v = 10;
+    } else if (st < 35) {
+      v = 5;
+    } else if (st > 80) {
+      v = -10;
+    } else if (st > 65) {
+      v = -5;
+    } else {
+      v = st >= 50 ? 1 : -1;
+    }
     score += v;
     maxScore += 10;
-    bd['Stoch'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+    bd['Stoch ${st.toStringAsFixed(0)}'] = v > 0 ? '↑ BULL' : '↓ BEAR';
     ind['stoch'] = st;
+  } else {
+    bd['Stoch'] = '→ NEUTRAL';
   }
 
-  final bullPat = candles.last.c >= candles.last.o;
-  score += bullPat ? 8 : -8;
-  maxScore += 8;
-  bd['Pattern'] = bullPat ? '↑ BULL' : '↓ BEAR';
+  // 11. Candle Pattern — weight 10
+  final pat = patternScore(candles);
+  ind['patternScore'] = pat.toDouble();
+  if (pat != 0) {
+    final v = pat * 5.0;
+    score += v;
+    maxScore += 10;
+    bd['Pattern'] = v > 0 ? '↑ BULL' : '↓ BEAR';
+  } else {
+    final lastC = candles.last;
+    final isBullCandle = lastC.c > lastC.o;
+    final v = isBullCandle ? 5.0 : -5.0; // fallback still actually votes, half weight
+    score += v;
+    maxScore += 10;
+    bd['Pattern'] = isBullCandle ? '↑ BULL' : '↓ BEAR';
+  }
 
   if (maxScore == 0) maxScore = 1;
-  final strength = (((score / maxScore) + 1) / 2 * 100).round().clamp(0, 100);
+  final strength = (((score / maxScore) + 1) / 2 * 100).clamp(0, 100);
   final bulls = bd.values.where((e) => e.contains('BULL')).length;
   final bears = bd.values.where((e) => e.contains('BEAR')).length;
   final total = max(1, bulls + bears);
@@ -256,10 +590,8 @@ Signal runEngine(List<Candle> candles) {
   return Signal(strength: strength, techConfidence: techConfidence, breakdown: bd, indicators: ind);
 }
 
-/// Grade is now purely about how CONFIDENT the final call is (0-99 accuracy),
-/// completely independent of whether the direction is CALL or PUT.
-/// A strong PUT and a strong CALL both reach A+; a weak/unclear read of
-/// either direction lands on C. This fixes the "PUT can only be C/D" bug.
+/// Grade is purely about how CONFIDENT the final call is (0-99 accuracy),
+/// independent of CALL vs PUT — a strong PUT and a strong CALL both reach A+.
 Map<String, dynamic> gradeFromAccuracy(int accuracy, String direction) {
   String grade;
   if (accuracy >= 88) {
@@ -274,21 +606,14 @@ Map<String, dynamic> gradeFromAccuracy(int accuracy, String direction) {
     grade = 'C';
   }
   final color = direction == 'CALL' ? T.green : T.red;
-  final arrow = direction == 'CALL' ? '▲' : '▼';
-  final prefix = grade == 'A+'
-      ? 'STRONG '
-      : grade == 'C'
-          ? 'WEAK '
-          : '';
   return {
     'grade': grade,
-    'label': '$prefix$direction $arrow',
     'color': grade == 'C' ? T.muted : color,
   };
 }
 
-/// Combines the technical engine (strength/confidence) with Gemini's
-/// read of the same data into one final CALL/PUT decision + accuracy score.
+/// Combines the 11-indicator engine with Gemini's read into one final
+/// decision. ALWAYS resolves to CALL or PUT — never leaves it undecided.
 FinalSignal buildFinalSignal({
   required Signal eng,
   required bool aiOk,
@@ -296,7 +621,6 @@ FinalSignal buildFinalSignal({
   required int aiConfidence,
   required String reason,
 }) {
-  // How far the technical engine is from neutral (50), scaled to 0-100.
   final techScore = ((eng.strength - 50).abs() * 2).clamp(0, 100);
   final techDirection = eng.strength >= 50 ? 'CALL' : 'PUT';
 
@@ -304,16 +628,12 @@ FinalSignal buildFinalSignal({
   int accuracy;
 
   if (!aiOk) {
-    // Gemini unavailable/failed → fall back to the technical engine alone.
     finalDirection = techDirection;
     accuracy = ((techScore * 0.7) + (eng.techConfidence * 0.3)).round().clamp(0, 95);
   } else {
     finalDirection = aiDirection;
     final agree = aiDirection == techDirection;
     final base = (techScore * 0.5) + (aiConfidence * 0.5);
-    // Reward when the engine and Gemini agree, penalize when they conflict —
-    // this is what "accuracy" actually reflects: agreement + raw confidence,
-    // not a guarantee of a winning trade.
     accuracy = agree ? min(99, (base + 8).round()) : max(20, (base - 18).round());
   }
 
@@ -328,12 +648,10 @@ FinalSignal buildFinalSignal({
 }
 
 // ───────────────── STORAGE ─────────────────
-// IMPORTANT: the main app and the floating overlay run in two SEPARATE
-// Flutter engines. shared_preferences caches all values in memory per
-// engine on first getInstance() call and normally never re-reads disk
-// after that. That stale cache was the real cause of the overlay being
-// stuck on one market and not seeing new API keys — calling reload()
-// before every read forces a fresh disk read on both sides, every time.
+// Main app and overlay run in two SEPARATE Flutter engines. shared_preferences
+// caches everything in memory per engine on first getInstance() and normally
+// never re-reads disk after that — reload() forces a fresh disk read every
+// time, on both sides, which is what keeps market/API keys in sync.
 class Store {
   static Future<SharedPreferences> _fresh() async {
     final p = await SharedPreferences.getInstance();
@@ -356,7 +674,7 @@ class Store {
 // ───────────────── API ─────────────────
 Future<List<Candle>> fetchCandles(String key, String symbol) async {
   final uri = Uri.parse(
-    'https://api.twelvedata.com/time_series?symbol=${Uri.encodeComponent(symbol)}&interval=1min&outputsize=80&apikey=$key',
+    'https://api.twelvedata.com/time_series?symbol=${Uri.encodeComponent(symbol)}&interval=1min&outputsize=80&timezone=UTC&apikey=$key',
   );
   final res = await http.get(uri);
   final data = jsonDecode(res.body);
@@ -369,8 +687,6 @@ Future<List<Candle>> fetchCandles(String key, String symbol) async {
   return list;
 }
 
-/// Builds a compact, token-cheap dump of the last candles for the AI prompt.
-/// Format per candle: o,h,l,c — separated by ';'.
 String _candleDump(List<Candle> candles, {int last = 30}) {
   final slice = candles.length > last ? candles.sublist(candles.length - last) : candles;
   return slice
@@ -379,8 +695,15 @@ String _candleDump(List<Candle> candles, {int last = 30}) {
       .join(';');
 }
 
+/// Every raw numeric result from all 11 indicators — nothing omitted.
 String _indicatorDump(Map<String, double> ind) {
   return ind.entries.map((e) => '${e.key}=${e.value.toStringAsFixed(5)}').join(', ');
+}
+
+/// Every indicator's own BULL/BEAR/NEUTRAL vote — the same breakdown the
+/// engine itself uses, so Gemini sees exactly what the engine saw.
+String _voteDump(Map<String, String> bd) {
+  return bd.entries.map((e) => '${e.key}:${e.value}').join(', ');
 }
 
 Future<Map<String, dynamic>> askGemini({
@@ -391,10 +714,6 @@ Future<Map<String, dynamic>> askGemini({
 }) async {
   try {
     final model = GenerativeModel(
-      // gemini-2.0-flash-lite was fully shut down by Google on 2026-06-01
-      // (that's why it kept 404'ing). gemini-3.1-flash-lite is the current
-      // stable, cheapest-tier model with no shutdown date announced —
-      // the right long-term pick for a live signal loop.
       model: 'gemini-3.1-flash-lite',
       apiKey: key,
       generationConfig: GenerationConfig(
@@ -403,7 +722,9 @@ Future<Map<String, dynamic>> askGemini({
         candidateCount: 1,
       ),
       systemInstruction: Content.system(
-        'You are a strict 1-minute forex signal filter. '
+        'You are a strict 1-minute forex signal filter analyzing 11 technical '
+        'indicators (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21, EMA21/50, '
+        'RSI, Bollinger, MACD, Stochastic, Pattern). '
         'You ONLY ever output exactly one line in this exact format, nothing else: '
         'DIRECTION|CONFIDENCE|REASON\n'
         'DIRECTION must be exactly the word CALL or PUT (nothing else). '
@@ -419,8 +740,9 @@ Pair: $market
 Recent 1m candles (oldest→newest, o,h,l,c per candle, ; separated):
 ${_candleDump(candles)}
 
-Computed indicators: ${_indicatorDump(eng.indicators)}
-Technical engine reading: strength=${eng.strength}/100, agreement=${eng.techConfidence}%
+All 11 indicator votes: ${_voteDump(eng.breakdown)}
+All raw indicator values: ${_indicatorDump(eng.indicators)}
+Technical engine reading: strength=${eng.strength.toStringAsFixed(1)}/100, agreement=${eng.techConfidence}%
 
 Respond with exactly one line: DIRECTION|CONFIDENCE|REASON
 ''';
@@ -539,12 +861,10 @@ class _LaunchPageState extends State<LaunchPage> {
       },
     );
     if (picked != null) {
-      // saveMarket already forces a fresh reload+write; setState after await
-      // so the LaunchPage UI and the persisted value never disagree.
       await Store.saveMarket(picked.td);
       setState(() {
         selected = picked;
-        msg = 'Market সেট হয়েছে: ${picked.name} — ফ্লোটিং বাবল বন্ধ থাকলে আবার START দিন, খোলা থাকলে পরের SIGNAL চাপেই নতুন মার্কেট ব্যবহার হবে';
+        msg = 'Market সেট হয়েছে: ${picked.name}';
       });
     }
   }
@@ -610,8 +930,8 @@ class _LaunchPageState extends State<LaunchPage> {
               ),
               const SizedBox(height: 4),
               const Center(
-                child: Text('HACKER FLOATING SIGNAL',
-                    style: TextStyle(color: T.dim, fontSize: 11, letterSpacing: 2)),
+                child: Text('HACKER FLOATING SIGNAL — 11 INDICATORS',
+                    style: TextStyle(color: T.dim, fontSize: 10, letterSpacing: 1)),
               ),
               const SizedBox(height: 24),
               Text(perm ? 'OVERLAY PERMISSION: ON' : 'OVERLAY PERMISSION: OFF',
@@ -713,7 +1033,7 @@ class _LaunchPageState extends State<LaunchPage> {
   }
 }
 
-// ───────────────── OVERLAY UI (view-only: no TextField / no ListView) ─────────────────
+// ───────────────── OVERLAY UI ─────────────────
 class OverlayHome extends StatefulWidget {
   const OverlayHome({super.key});
   @override
@@ -727,7 +1047,7 @@ class _OverlayHomeState extends State<OverlayHome> {
   Market selected = markets.first;
   FinalSignal? finalSignal;
   List<Candle> candles = [];
-  String lastCandleTime = ''; // last closed candle's timestamp, shown so the user can confirm data is fresh
+  String lastCandleTimeLocal = ''; // UTC candle time converted to phone-local time
 
   @override
   void initState() {
@@ -736,9 +1056,6 @@ class _OverlayHomeState extends State<OverlayHome> {
       if (mounted) {
         setState(() => time = DateFormat('HH:mm:ss').format(DateTime.now()));
       }
-      // Re-check the saved market every tick too (cheap, and reload() makes
-      // it accurate now) so the header chip updates even before you tap
-      // SIGNAL, if you changed the market in the main app moments ago.
       loadMarket();
     });
     loadMarket();
@@ -759,10 +1076,23 @@ class _OverlayHomeState extends State<OverlayHome> {
     super.dispose();
   }
 
+  String _toLocalTimeLabel(String utcDatetime) {
+    if (utcDatetime.isEmpty) return '';
+    try {
+      // TwelveData is requested with timezone=UTC, so parse as UTC then
+      // convert to the phone's local time — matches the header clock exactly.
+      final iso = '${utcDatetime.replaceFirst(' ', 'T')}Z';
+      final dt = DateTime.parse(iso);
+      final local = dt.toLocal();
+      return DateFormat('HH:mm:ss').format(local);
+    } catch (_) {
+      return utcDatetime;
+    }
+  }
+
   Future<void> generate() async {
-    // reload market in case it was changed in the main app since overlay opened
     await loadMarket();
-    final marketAtRequest = selected; // freeze which market this specific scan is for
+    final marketAtRequest = selected;
     final key = await Store.td();
     if (key.isEmpty) {
       setState(() {
@@ -779,7 +1109,6 @@ class _OverlayHomeState extends State<OverlayHome> {
     setState(() => scanning = true);
     try {
       final cs = await fetchCandles(key, marketAtRequest.td);
-      // if the user switched markets again while this fetch was running, drop this stale result
       final nowMarket = await Store.market();
       if (nowMarket != marketAtRequest.td) {
         if (mounted) setState(() => scanning = false);
@@ -807,7 +1136,7 @@ class _OverlayHomeState extends State<OverlayHome> {
       setState(() {
         candles = cs;
         finalSignal = fs;
-        lastCandleTime = cs.isNotEmpty ? cs.last.time : '';
+        lastCandleTimeLocal = cs.isNotEmpty ? _toLocalTimeLabel(cs.last.time) : '';
         selected = marketAtRequest;
         scanning = false;
       });
@@ -839,10 +1168,6 @@ class _OverlayHomeState extends State<OverlayHome> {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: border, width: 1.5),
         ),
-        // Column gets bounded height from the fixed-size overlay window
-        // (height:600 set in showOverlay), so Expanded below is valid and
-        // makes the button row ALWAYS reachable no matter how much content
-        // sits above it — this is what fixes the "stuck overlay" bug.
         child: Column(
           children: [
             Row(
@@ -850,7 +1175,6 @@ class _OverlayHomeState extends State<OverlayHome> {
                 const Text('RTX ROBOT',
                     style: TextStyle(color: T.green, fontSize: 12, fontWeight: FontWeight.w900)),
                 const Spacer(),
-                // Prominent market chip in the header — always visible, always current.
                 Flexible(
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -966,16 +1290,12 @@ class _OverlayHomeState extends State<OverlayHome> {
     );
   }
 
-  // Indicator breakdown chips are intentionally NOT rendered here anymore —
-  // per your request they run in the background only. This box now shows
-  // the market name again (big, at the top) + the final decision + the
-  // timestamp of the last candle used, so it's always obvious which market
-  // and which fresh piece of data the signal belongs to.
   Widget signalBox() {
     if (scanning) {
       return Padding(
         padding: const EdgeInsets.all(14),
-        child: Text('SCANNING ${selected.name}...',
+        child: Text('SCANNING ${selected.name} (11 indicators)...',
+            textAlign: TextAlign.center,
             style: const TextStyle(color: T.green, fontWeight: FontWeight.bold, fontSize: 13)),
       );
     }
@@ -1011,9 +1331,9 @@ class _OverlayHomeState extends State<OverlayHome> {
           const SizedBox(height: 8),
           Text('ACCURACY ${fs.accuracy}%',
               style: const TextStyle(color: T.cyan, fontSize: 13, fontWeight: FontWeight.bold)),
-          if (lastCandleTime.isNotEmpty) ...[
+          if (lastCandleTimeLocal.isNotEmpty) ...[
             const SizedBox(height: 5),
-            Text('Data: $lastCandleTime',
+            Text('Data: $lastCandleTimeLocal (local)',
                 style: const TextStyle(color: T.dim, fontSize: 10)),
           ],
           if (fs.reason.isNotEmpty) ...[
