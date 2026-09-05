@@ -1,0 +1,92 @@
+name: Build RTX ROBOT APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.24.5"
+
+      - name: Generate Android platform files
+        run: |
+          flutter create --org com.rtxrobot --project-name rtx_robot --platforms=android .
+
+      - name: Patch AndroidManifest for overlay
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          # Add permissions before <application>
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"\/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"\/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"\/>\n\n    <application|' "$MANIFEST"
+
+          # Add overlay service before </application>.
+          # IMPORTANT: Android 14 (API 34+) requires a <property> tag declaring
+          # PROPERTY_SPECIAL_USE_FGS_SUBTYPE for any "specialUse" foreground
+          # service, or the service can crash / silently fail to start on
+          # newer devices — this was missing before and is the most likely
+          # second cause behind the overlay freezing up.
+          sed -i 's|<\/application>|        <service\n            android:name="flutter.overlay.window.flutter_overlay_window.OverlayService"\n            android:exported="false"\n            android:foregroundServiceType="specialUse">\n            <property\n                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\n                android:value="floating_trading_signal_overlay" \/>\n        <\/service>\n    <\/application>|' "$MANIFEST"
+
+          echo "----- AndroidManifest.xml -----"
+          cat "$MANIFEST"
+
+      - name: Set minSdk 24
+        run: |
+          # Flutter's Gradle templates vary by version/DSL (Groovy vs Kotlin),
+          # and the minSdk line's exact form varies too. Try every common
+          # pattern, and PRINT A CLEAR WARNING instead of silently doing
+          # nothing if none matched — a silent skip here previously could
+          # leave minSdk at whatever Flutter's default is without anyone
+          # noticing in the CI logs.
+          PATCHED=0
+
+          if [ -f android/app/build.gradle ]; then
+            if grep -qE 'minSdk(Version)?\b' android/app/build.gradle; then
+              sed -i -E 's/minSdkVersion[[:space:]]+[a-zA-Z0-9_.]+/minSdkVersion 24/' android/app/build.gradle
+              sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[a-zA-Z0-9_.]+/minSdk = 24/' android/app/build.gradle
+              PATCHED=1
+            fi
+          fi
+
+          if [ -f android/app/build.gradle.kts ]; then
+            if grep -qE 'minSdk\b' android/app/build.gradle.kts; then
+              sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[a-zA-Z0-9_.]+/minSdk = 24/' android/app/build.gradle.kts
+              PATCHED=1
+            fi
+          fi
+
+          if [ "$PATCHED" -eq 0 ]; then
+            echo "::warning::minSdk line not found in build.gradle or build.gradle.kts — minSdk 24 was NOT applied, check the Gradle file format manually."
+          else
+            echo "minSdk 24 patch applied."
+          fi
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RTX-ROBOT-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
