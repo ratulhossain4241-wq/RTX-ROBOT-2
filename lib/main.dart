@@ -581,7 +581,7 @@ Signal runEngine(List<Candle> candles) {
   }
 
   if (maxScore == 0) maxScore = 1;
-  final strength = (((score / maxScore) + 1) / 2 * 100).clamp(0, 100);
+  final strength = (((score / maxScore) + 1) / 2 * 100).clamp(0.0, 100.0).toDouble();
   final bulls = bd.values.where((e) => e.contains('BULL')).length;
   final bears = bd.values.where((e) => e.contains('BEAR')).length;
   final total = max(1, bulls + bears);
@@ -621,7 +621,7 @@ FinalSignal buildFinalSignal({
   required int aiConfidence,
   required String reason,
 }) {
-  final techScore = ((eng.strength - 50).abs() * 2).clamp(0, 100);
+  final techScore = ((eng.strength - 50).abs() * 2).clamp(0, 100).toDouble();
   final techDirection = eng.strength >= 50 ? 'CALL' : 'PUT';
 
   String finalDirection;
@@ -629,7 +629,7 @@ FinalSignal buildFinalSignal({
 
   if (!aiOk) {
     finalDirection = techDirection;
-    accuracy = ((techScore * 0.7) + (eng.techConfidence * 0.3)).round().clamp(0, 95);
+    accuracy = ((techScore * 0.7) + (eng.techConfidence * 0.3)).round().clamp(0, 95).toInt();
   } else {
     finalDirection = aiDirection;
     final agree = aiDirection == techDirection;
@@ -1277,7 +1277,7 @@ class _OverlayHomeState extends State<OverlayHome> {
         crossAxisAlignment: CrossAxisAlignment.end,
         children: list.map((c) {
           final bull = c.c >= c.o;
-          final h = ((c.c - minL) / range).clamp(0.15, 1.0);
+          final h = ((c.c - minL) / range).clamp(0.15, 1.0).toDouble();
           return Expanded(
             child: Container(
               margin: const EdgeInsets.symmetric(horizontal: 1),
