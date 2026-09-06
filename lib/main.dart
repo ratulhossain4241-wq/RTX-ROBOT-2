@@ -718,7 +718,7 @@ Future<Map<String, dynamic>> askGemini({
       apiKey: key,
       generationConfig: GenerationConfig(
         temperature: 0.15,
-        maxOutputTokens: 100,
+        maxOutputTokens: 40,
         candidateCount: 1,
       ),
       systemInstruction: Content.system(
@@ -727,16 +727,10 @@ Future<Map<String, dynamic>> askGemini({
         'RSI, Bollinger, MACD, Stochastic, Pattern). '
         'You ONLY ever output exactly one line in this exact format, nothing else: '
         'DIRECTION|CONFIDENCE|REASON\n'
-        'DIRECTION must be exactly the word CALL or PUT in English (nothing else) — '
-        'never blank, never both, always pick one with certainty. '
+        'DIRECTION must be exactly the word CALL or PUT (nothing else). '
         'CONFIDENCE is an integer 0-100. '
-        'REASON must be written in Bengali (বাংলা), up to about 20 words: '
-        'if the indicators conflict or the setup looks risky/uncertain, explain '
-        'in Bengali WHY it is risky or confusing; if the indicators agree well, '
-        'explain in Bengali WHY you are confident. Either way REASON ends with '
-        'the same certain direction already given in the DIRECTION field. '
-        'No punctuation beyond commas in REASON. '
-        'Never add greetings, disclaimers, markdown, or extra lines beyond the one required. '
+        'REASON is at most 6 words, no punctuation beyond a comma. '
+        'Never add greetings, disclaimers, markdown, explanations, or extra lines. '
         'Never refuse to answer — always pick CALL or PUT based on the data given.',
       ),
     );
@@ -1346,7 +1340,7 @@ class _OverlayHomeState extends State<OverlayHome> {
             const SizedBox(height: 8),
             Text(fs.reason,
                 textAlign: TextAlign.center,
-                maxLines: 3,
+                maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: T.dim, fontSize: 11)),
           ],
