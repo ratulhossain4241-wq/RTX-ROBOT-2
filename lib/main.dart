@@ -6,7 +6,6 @@ import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -43,6 +42,11 @@ class T {
   static const cyan = Color(0xFF00FFFF);
   static const dim = Color(0xFF0A6E0A);
   static const muted = Color(0xFF333333);
+  // Ghost-candle colors — UP prediction = white, DOWN prediction = gold
+  static const ghostUpFill = Color(0x73FFFFFF);
+  static const ghostUpBorder = Color(0xFFFFFFFF);
+  static const ghostDownFill = Color(0x73F3BA2F);
+  static const ghostDownBorder = Color(0xFFF3BA2F);
 }
 
 // ───────────────── MARKETS ─────────────────
@@ -79,6 +83,14 @@ class Candle {
         double.parse(j['close'].toString()),
         (j['datetime'] ?? '').toString(),
       );
+}
+
+/// One AI-predicted "ghost" candle. Two of these are shown per prediction,
+/// each with its OWN direction — never forced to match each other.
+class GhostCandle {
+  final double open, high, low, close;
+  GhostCandle({required this.open, required this.high, required this.low, required this.close});
+  bool get isUp => close >= open;
 }
 
 /// Pure technical-engine output — 11 indicators, ported 1:1 from the web
@@ -695,86 +707,211 @@ String _candleDump(List<Candle> candles, {int last = 30}) {
       .join(';');
 }
 
-/// Every raw numeric result from all 11 indicators — nothing omitted.
-String _indicatorDump(Map<String, double> ind) {
-  return ind.entries.map((e) => '${e.key}=${e.value.toStringAsFixed(5)}').join(', ');
-}
-
 /// Every indicator's own BULL/BEAR/NEUTRAL vote — the same breakdown the
 /// engine itself uses, so Gemini sees exactly what the engine saw.
 String _voteDump(Map<String, String> bd) {
   return bd.entries.map((e) => '${e.key}:${e.value}').join(', ');
 }
 
-Future<Map<String, dynamic>> askGemini({
+/// JPY pairs quote to 3 decimals, everything else to 5 — used to round
+/// the ghost candles to a sane precision for the pair being traded.
+int _decimalsFor(String symbol) => symbol.toUpperCase().contains('JPY') ? 3 : 5;
+
+const _ghostSystemInstruction =
+    'You are a strict 1-minute forex candle predictor analyzing 11 technical '
+    'indicators (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21, EMA21/50, '
+    'RSI, Bollinger, MACD, Stochastic, Pattern).\n'
+    'You predict the NEXT TWO consecutive 1-minute candles (candle 1 = next '
+    'minute, candle 2 = the minute after that). The two candles are '
+    'INDEPENDENT — candle 2 does not have to move the same direction as '
+    'candle 1; judge each one purely on its own merits.\n'
+    'You ONLY ever output exactly one line in this exact format, nothing else:\n'
+    'O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON\n'
+    'O1, H1, L1, C1 are candle 1 open/high/low/close. O1 must equal the last '
+    'known close given to you. H1 must be >= max(O1,C1). L1 must be <= min(O1,C1).\n'
+    'H2, L2, C2 are candle 2 high/low/close (candle 2 open is fixed to equal '
+    'C1, so do not output it). H2 must be >= max(C1,C2). L2 must be <= min(C1,C2).\n'
+    'All six prices use the same number of decimal places as the input prices.\n'
+    'CONFIDENCE is an integer 0-100, your confidence in candle 1.\n'
+    'REASON must be written in Bengali (বাংলা), up to about 20 words explaining '
+    'why you are confident or why the setup is risky/uncertain. No punctuation '
+    'beyond commas in REASON.\n'
+    'Never add greetings, disclaimers, markdown, or extra lines beyond the one required.\n'
+    'Never refuse to answer — always output definite predicted candles.';
+
+/// Predicts the next TWO ghost candles via Gemini's REST API directly
+/// (not the google_generative_ai package) so every HTTP status code and
+/// error payload can be inspected and turned into a specific Bengali
+/// message — this is what lets you actually diagnose a failure instead of
+/// just seeing a generic "AI error".
+Future<Map<String, dynamic>> predictGhostCandles({
   required String key,
   required String market,
   required List<Candle> candles,
   required Signal eng,
 }) async {
-  try {
-    final model = GenerativeModel(
-      model: 'gemini-3.1-flash-lite',
-      apiKey: key,
-      generationConfig: GenerationConfig(
-        temperature: 0.15,
-        maxOutputTokens: 40,
-        candidateCount: 1,
-      ),
-      systemInstruction: Content.system(
-        'You are a strict 1-minute forex signal filter analyzing 11 technical '
-        'indicators (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21, EMA21/50, '
-        'RSI, Bollinger, MACD, Stochastic, Pattern). '
-        'You ONLY ever output exactly one line in this exact format, nothing else: '
-        'DIRECTION|CONFIDENCE|REASON\n'
-        'DIRECTION must be exactly the word CALL or PUT (nothing else). '
-        'CONFIDENCE is an integer 0-100. '
-        'REASON is at most 6 words, no punctuation beyond a comma. '
-        'Never add greetings, disclaimers, markdown, explanations, or extra lines. '
-        'Never refuse to answer — always pick CALL or PUT based on the data given.',
-      ),
-    );
+  final lastClose = candles.last.c;
+  final decimals = _decimalsFor(market);
 
-    final prompt = '''
+  // Sane fallback if Gemini fails or there's no key: project two small moves
+  // off the engine's own direction, sized from recent candle ranges — the
+  // ghost candles are never left empty, and the reason always explains why.
+  Map<String, dynamic> fallback(String reasonText, String errorType) {
+    final recent = candles.length > 10 ? candles.sublist(candles.length - 10) : candles;
+    final avgRange = recent.map((c) => c.h - c.l).reduce((a, b) => a + b) / recent.length;
+    final bullish = eng.strength >= 50;
+    final move = avgRange * 0.4;
+
+    final c1o = lastClose;
+    final c1c = bullish ? c1o + move : c1o - move;
+    final c1h = max(c1o, c1c) + avgRange * 0.15;
+    final c1l = min(c1o, c1c) - avgRange * 0.15;
+
+    final c2o = c1c;
+    final c2c = bullish ? c2o + move * 0.7 : c2o - move * 0.7;
+    final c2h = max(c2o, c2c) + avgRange * 0.15;
+    final c2l = min(c2o, c2c) - avgRange * 0.15;
+
+    double round(double n) => double.parse(n.toStringAsFixed(decimals));
+    return {
+      'candle1': GhostCandle(open: round(c1o), high: round(c1h), low: round(c1l), close: round(c1c)),
+      'candle2': GhostCandle(open: round(c2o), high: round(c2h), low: round(c2l), close: round(c2c)),
+      'confidence': 0,
+      'reason': reasonText,
+      'ok': false,
+      'errorType': errorType,
+    };
+  }
+
+  if (key.isEmpty) {
+    return fallback('Gemini key নেই — শুধু ইন্ডিকেটর দিয়ে অনুমান করা হলো', 'no_key');
+  }
+
+  final prompt = '''
 Pair: $market
 Recent 1m candles (oldest→newest, o,h,l,c per candle, ; separated):
 ${_candleDump(candles)}
 
+Last known close (this is O1, the open of candle 1): ${lastClose.toStringAsFixed(decimals)}
 All 11 indicator votes: ${_voteDump(eng.breakdown)}
-All raw indicator values: ${_indicatorDump(eng.indicators)}
 Technical engine reading: strength=${eng.strength.toStringAsFixed(1)}/100, agreement=${eng.techConfidence}%
 
-Respond with exactly one line: DIRECTION|CONFIDENCE|REASON
+Respond with exactly one line: O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON
 ''';
 
-    final out = await model.generateContent([Content.text(prompt)]);
-    final text = (out.text ?? '').trim();
-    final p = text.split('|');
-    if (p.length >= 3) {
-      final d = p[0].trim().toUpperCase();
-      final c = int.tryParse(p[1].trim().replaceAll(RegExp(r'[^0-9]'), '')) ?? 50;
-      if (d == 'CALL' || d == 'PUT') {
-        return <String, dynamic>{
-          'direction': d,
-          'ai': c.clamp(0, 100),
-          'reason': p.sublist(2).join('|').trim(),
-          'ok': true,
-        };
-      }
+  http.Response res;
+  try {
+    final uri = Uri.parse(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${Uri.encodeComponent(key)}',
+    );
+    res = await http
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'systemInstruction': {
+              'parts': [
+                {'text': _ghostSystemInstruction}
+              ]
+            },
+            'contents': [
+              {
+                'role': 'user',
+                'parts': [
+                  {'text': prompt}
+                ]
+              }
+            ],
+            'generationConfig': {'temperature': 0.15, 'maxOutputTokens': 140, 'candidateCount': 1},
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+  } on TimeoutException {
+    return fallback('Gemini রেসপন্সে সময় বেশি লাগছে (timeout), ইন্ডিকেটর দিয়ে অনুমান', 'timeout');
+  } catch (e) {
+    return fallback('নেটওয়ার্ক/সার্ভার সমস্যা: $e', 'network');
+  }
+
+  Map<String, dynamic> body;
+  try {
+    body = jsonDecode(res.body) as Map<String, dynamic>;
+  } catch (_) {
+    return fallback('Gemini রেসপন্স পার্স করা যায়নি (status ${res.statusCode})', 'parse');
+  }
+
+  if (res.statusCode != 200 || body['error'] != null) {
+    final err = body['error'] as Map<String, dynamic>?;
+    final msg = err?['message']?.toString() ?? 'Unknown error';
+    final details = (err?['details'] as List?) ?? [];
+    final reasonCode = details
+        .whereType<Map>()
+        .map((d) => d['reason']?.toString() ?? '')
+        .firstWhere((r) => r.isNotEmpty, orElse: () => '');
+
+    if (reasonCode == 'ACCESS_TOKEN_TYPE_UNSUPPORTED') {
+      return fallback(
+        'Gemini key (AQ. ফরম্যাট) দিয়ে সরাসরি REST কল Google-এর বাগের কারণে কাজ করছে না — AI Studio থেকে নতুন key ট্রাই করুন',
+        'aq_key_bug',
+      );
     }
-    return <String, dynamic>{
-      'direction': eng.strength >= 50 ? 'CALL' : 'PUT',
-      'ai': 0,
-      'reason': 'Unrecognized AI response, using engine',
-      'ok': false,
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      return fallback('Gemini API key ভুল বা অবৈধ ($msg)', 'auth');
+    }
+    if (res.statusCode == 404) {
+      return fallback('Gemini মডেল পাওয়া যায়নি ($msg)', 'not_found');
+    }
+    if (res.statusCode == 429) {
+      return fallback('Gemini দৈনিক/মিনিট লিমিট শেষ, একটু পর আবার চেষ্টা করুন', 'rate_limit');
+    }
+    if (res.statusCode >= 500) {
+      return fallback('Gemini সার্ভারে সাময়িক সমস্যা, একটু পর আবার চেষ্টা করুন', 'server');
+    }
+    return fallback('Gemini error (${res.statusCode}): $msg', 'bad_request');
+  }
+
+  final candidates = body['candidates'] as List?;
+  final text = (candidates != null && candidates.isNotEmpty)
+      ? (candidates[0]['content']?['parts']?[0]?['text']?.toString() ?? '')
+      : '';
+  if (text.trim().isEmpty) {
+    return fallback('Gemini থেকে কোনো উত্তর আসেনি (খালি রেসপন্স)', 'empty');
+  }
+
+  final parts = text.trim().split('|');
+  if (parts.length < 9) {
+    return fallback('AI রেসপন্স ফরম্যাট ভুল ছিলো, ইঞ্জিন দিয়ে অনুমান করা হলো', 'format');
+  }
+
+  try {
+    final o1 = double.parse(parts[0].trim());
+    final h1 = double.parse(parts[1].trim());
+    final l1 = double.parse(parts[2].trim());
+    final c1 = double.parse(parts[3].trim());
+    final h2 = double.parse(parts[4].trim());
+    final l2 = double.parse(parts[5].trim());
+    final c2 = double.parse(parts[6].trim());
+    final confidence =
+        int.tryParse(parts[7].trim().replaceAll(RegExp(r'[^0-9]'), '')) ?? 50;
+    final reason = parts.sublist(8).join('|').trim();
+    final o2 = c1; // forced chain — candle 2 always opens where candle 1 closed
+
+    final range1Valid = h1 >= max(o1, c1) && l1 <= min(o1, c1);
+    final range2Valid = h2 >= max(o2, c2) && l2 <= min(o2, c2);
+    if (!range1Valid || !range2Valid) {
+      return fallback('AI ভুল রেঞ্জের ক্যান্ডেল দিয়েছে, ইঞ্জিন দিয়ে অনুমান করা হলো', 'range_invalid');
+    }
+
+    double round(double n) => double.parse(n.toStringAsFixed(decimals));
+    return {
+      'candle1': GhostCandle(open: round(o1), high: round(h1), low: round(l1), close: round(c1)),
+      'candle2': GhostCandle(open: round(o2), high: round(h2), low: round(l2), close: round(c2)),
+      'confidence': confidence.clamp(0, 100),
+      'reason': reason.isNotEmpty ? reason : 'কোনো কারণ দেওয়া হয়নি',
+      'ok': true,
+      'errorType': null,
     };
   } catch (e) {
-    return <String, dynamic>{
-      'direction': eng.strength >= 50 ? 'CALL' : 'PUT',
-      'ai': 0,
-      'reason': 'AI error: $e',
-      'ok': false,
-    };
+    return fallback('AI সংখ্যা পার্স করা যায়নি: $e', 'number_parse');
   }
 }
 
@@ -930,7 +1067,7 @@ class _LaunchPageState extends State<LaunchPage> {
               ),
               const SizedBox(height: 4),
               const Center(
-                child: Text('HACKER FLOATING SIGNAL — 11 INDICATORS',
+                child: Text('HACKER FLOATING SIGNAL — 11 INDICATORS + GHOST CANDLE',
                     style: TextStyle(color: T.dim, fontSize: 10, letterSpacing: 1)),
               ),
               const SizedBox(height: 24),
@@ -945,7 +1082,7 @@ class _LaunchPageState extends State<LaunchPage> {
               const SizedBox(height: 8),
               _field(tdCtrl, 'Twelve Data API Key (আবশ্যক)'),
               const SizedBox(height: 10),
-              _field(gemCtrl, 'Gemini API Key (ঐচ্ছিক)'),
+              _field(gemCtrl, 'Gemini API Key (ঐচ্ছিক, ঘোস্ট ক্যান্ডেলের জন্য)'),
               const SizedBox(height: 10),
               OutlinedButton(
                 style: OutlinedButton.styleFrom(
@@ -1033,6 +1170,99 @@ class _LaunchPageState extends State<LaunchPage> {
   }
 }
 
+// ───────────────── GHOST CANDLE CHART PAINTER ─────────────────
+class _OhlcBox {
+  final double o, h, l, c;
+  final bool isGhost;
+  _OhlcBox({required this.o, required this.h, required this.l, required this.c, this.isGhost = false});
+  bool get isUp => c >= o;
+}
+
+/// Draws real candles (green/red) followed by up to 2 ghost candles
+/// (white=UP prediction, gold=DOWN prediction) with a divider between them.
+/// Each ghost candle's color is entirely independent of the other.
+class GhostCandlePainter extends CustomPainter {
+  final List<Candle> realCandles;
+  final GhostCandle? ghost1;
+  final GhostCandle? ghost2;
+  GhostCandlePainter({required this.realCandles, this.ghost1, this.ghost2});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final all = <_OhlcBox>[
+      for (final c in realCandles) _OhlcBox(o: c.o, h: c.h, l: c.l, c: c.c),
+    ];
+    if (ghost1 != null) {
+      all.add(_OhlcBox(o: ghost1!.open, h: ghost1!.high, l: ghost1!.low, c: ghost1!.close, isGhost: true));
+    }
+    if (ghost2 != null) {
+      all.add(_OhlcBox(o: ghost2!.open, h: ghost2!.high, l: ghost2!.low, c: ghost2!.close, isGhost: true));
+    }
+    if (all.isEmpty) return;
+
+    final maxH = all.map((e) => e.h).reduce(max);
+    final minL = all.map((e) => e.l).reduce(min);
+    final range = (maxH - minL) == 0 ? 0.0001 : (maxH - minL);
+    final slotW = size.width / all.length;
+    final bodyW = slotW * 0.55;
+
+    double yFor(double v) => size.height - ((v - minL) / range) * size.height;
+
+    for (var i = 0; i < all.length; i++) {
+      final box = all[i];
+      final cx = slotW * i + slotW / 2;
+      final up = box.isUp;
+
+      final lineColor = box.isGhost
+          ? (up ? T.ghostUpBorder : T.ghostDownBorder)
+          : (up ? T.green : T.red);
+      final fillColor = box.isGhost
+          ? (up ? T.ghostUpFill : T.ghostDownFill)
+          : (up ? T.green : T.red);
+
+      canvas.drawLine(
+        Offset(cx, yFor(box.h)),
+        Offset(cx, yFor(box.l)),
+        Paint()
+          ..color = lineColor
+          ..strokeWidth = 1.2,
+      );
+
+      final bodyTop = yFor(max(box.o, box.c));
+      final bodyBottom = max(yFor(min(box.o, box.c)), bodyTop + 1.5);
+      final rect = Rect.fromLTRB(cx - bodyW / 2, bodyTop, cx + bodyW / 2, bodyBottom);
+      canvas.drawRect(rect, Paint()..color = fillColor);
+      if (box.isGhost) {
+        canvas.drawRect(
+          rect,
+          Paint()
+            ..color = lineColor
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.3,
+        );
+      }
+    }
+
+    if (ghost1 != null && realCandles.isNotEmpty) {
+      final dx = slotW * realCandles.length;
+      canvas.drawLine(
+        Offset(dx, 0),
+        Offset(dx, size.height),
+        Paint()
+          ..color = T.muted
+          ..strokeWidth = 1,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant GhostCandlePainter oldDelegate) {
+    return oldDelegate.realCandles != realCandles ||
+        oldDelegate.ghost1 != ghost1 ||
+        oldDelegate.ghost2 != ghost2;
+  }
+}
+
 // ───────────────── OVERLAY UI ─────────────────
 class OverlayHome extends StatefulWidget {
   const OverlayHome({super.key});
@@ -1044,9 +1274,12 @@ class _OverlayHomeState extends State<OverlayHome> {
   String time = '--:--:--';
   Timer? timer;
   bool scanning = false;
+  bool predicting = false;
   Market selected = markets.first;
   FinalSignal? finalSignal;
   List<Candle> candles = [];
+  List<GhostCandle>? predictedCandles; // [candle1, candle2] or null
+  String predictedReason = '';
   String lastCandleTimeLocal = ''; // UTC candle time converted to phone-local time
 
   @override
@@ -1079,8 +1312,6 @@ class _OverlayHomeState extends State<OverlayHome> {
   String _toLocalTimeLabel(String utcDatetime) {
     if (utcDatetime.isEmpty) return '';
     try {
-      // TwelveData is requested with timezone=UTC, so parse as UTC then
-      // convert to the phone's local time — matches the header clock exactly.
       final iso = '${utcDatetime.replaceFirst(' ', 'T')}Z';
       final dt = DateTime.parse(iso);
       final local = dt.toLocal();
@@ -1106,7 +1337,11 @@ class _OverlayHomeState extends State<OverlayHome> {
       });
       return;
     }
-    setState(() => scanning = true);
+    setState(() {
+      scanning = true;
+      predictedCandles = null;
+      predictedReason = '';
+    });
     try {
       final cs = await fetchCandles(key, marketAtRequest.td);
       final nowMarket = await Store.market();
@@ -1116,26 +1351,38 @@ class _OverlayHomeState extends State<OverlayHome> {
       }
       final eng = runEngine(cs);
       final gKey = await Store.gem();
-      Map<String, dynamic> ai = <String, dynamic>{
-        'direction': eng.strength >= 50 ? 'CALL' : 'PUT',
-        'ai': 0,
-        'reason': 'No Gemini key — engine only',
-        'ok': false,
-      };
-      if (gKey.isNotEmpty) {
-        ai = await askGemini(key: gKey, market: marketAtRequest.name, candles: cs, eng: eng);
-      }
+
+      setState(() => predicting = true);
+      final gh = await predictGhostCandles(
+        key: gKey,
+        market: marketAtRequest.name,
+        candles: cs,
+        eng: eng,
+      );
+      if (!mounted) return;
+      setState(() => predicting = false);
+
+      final c1 = gh['candle1'] as GhostCandle;
+      final c2 = gh['candle2'] as GhostCandle;
+      final aiDirection = c1.isUp ? 'CALL' : 'PUT';
+      final aiConfidence = gh['confidence'] as int;
+      final aiOk = gh['ok'] as bool;
+      final reason = gh['reason'] as String;
+
       final fs = buildFinalSignal(
         eng: eng,
-        aiOk: ai['ok'] as bool,
-        aiDirection: ai['direction'] as String,
-        aiConfidence: (ai['ai'] as num).toInt(),
-        reason: ai['reason']?.toString() ?? '',
+        aiOk: aiOk,
+        aiDirection: aiDirection,
+        aiConfidence: aiConfidence,
+        reason: reason,
       );
+
       if (!mounted) return;
       setState(() {
         candles = cs;
         finalSignal = fs;
+        predictedCandles = [c1, c2];
+        predictedReason = reason;
         lastCandleTimeLocal = cs.isNotEmpty ? _toLocalTimeLabel(cs.last.time) : '';
         selected = marketAtRequest;
         scanning = false;
@@ -1144,6 +1391,7 @@ class _OverlayHomeState extends State<OverlayHome> {
       if (!mounted) return;
       setState(() {
         scanning = false;
+        predicting = false;
         finalSignal = FinalSignal(
           grade: '-',
           direction: '-',
@@ -1198,7 +1446,11 @@ class _OverlayHomeState extends State<OverlayHome> {
                 physics: const ClampingScrollPhysics(),
                 child: Column(
                   children: [
-                    miniChart(),
+                    candleChart(),
+                    if (predictedCandles != null) ...[
+                      const SizedBox(height: 6),
+                      ghostLegend(),
+                    ],
                     const SizedBox(height: 10),
                     signalBox(),
                   ],
@@ -1248,11 +1500,11 @@ class _OverlayHomeState extends State<OverlayHome> {
     );
   }
 
-  Widget miniChart() {
+  Widget candleChart() {
     final list = candles.length > 15 ? candles.sublist(candles.length - 15) : candles;
     if (list.isEmpty) {
       return Container(
-        height: 52,
+        height: 90,
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: Colors.black,
@@ -1262,31 +1514,42 @@ class _OverlayHomeState extends State<OverlayHome> {
         child: const Text('NO CHART YET', style: TextStyle(color: T.dim, fontSize: 11)),
       );
     }
-    final maxH = list.map((e) => e.h).reduce(max);
-    final minL = list.map((e) => e.l).reduce(min);
-    final range = (maxH - minL) == 0 ? 0.001 : (maxH - minL);
     return Container(
-      height: 52,
-      padding: const EdgeInsets.all(5),
+      height: 90,
+      padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: T.muted),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: list.map((c) {
-          final bull = c.c >= c.o;
-          final h = ((c.c - minL) / range).clamp(0.15, 1.0).toDouble();
-          return Expanded(
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 1),
-              height: 42 * h,
-              color: bull ? T.green : T.red,
-            ),
-          );
-        }).toList(),
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: GhostCandlePainter(
+          realCandles: list,
+          ghost1: predictedCandles != null && predictedCandles!.isNotEmpty ? predictedCandles![0] : null,
+          ghost2: predictedCandles != null && predictedCandles!.length > 1 ? predictedCandles![1] : null,
+        ),
       ),
+    );
+  }
+
+  Widget ghostLegend() {
+    return Wrap(
+      spacing: 12,
+      runSpacing: 4,
+      alignment: WrapAlignment.center,
+      children: [
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 9, height: 9, decoration: BoxDecoration(color: T.ghostUpFill, border: Border.all(color: T.ghostUpBorder), borderRadius: BorderRadius.circular(2))),
+          const SizedBox(width: 4),
+          const Text('সাদা = AI প্রেডিক্টেড UP', style: TextStyle(color: T.dim, fontSize: 9)),
+        ]),
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 9, height: 9, decoration: BoxDecoration(color: T.ghostDownFill, border: Border.all(color: T.ghostDownBorder), borderRadius: BorderRadius.circular(2))),
+          const SizedBox(width: 4),
+          const Text('গোল্ড = AI প্রেডিক্টেড DOWN', style: TextStyle(color: T.dim, fontSize: 9)),
+        ]),
+      ],
     );
   }
 
@@ -1294,9 +1557,11 @@ class _OverlayHomeState extends State<OverlayHome> {
     if (scanning) {
       return Padding(
         padding: const EdgeInsets.all(14),
-        child: Text('SCANNING ${selected.name} (11 indicators)...',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: T.green, fontWeight: FontWeight.bold, fontSize: 13)),
+        child: Text(
+          predicting ? 'Gemini ভাবছে (২টা ঘোস্ট ক্যান্ডেল)...' : 'SCANNING ${selected.name} (11 indicators)...',
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: T.green, fontWeight: FontWeight.bold, fontSize: 13),
+        ),
       );
     }
     final fs = finalSignal;
@@ -1340,7 +1605,7 @@ class _OverlayHomeState extends State<OverlayHome> {
             const SizedBox(height: 8),
             Text(fs.reason,
                 textAlign: TextAlign.center,
-                maxLines: 2,
+                maxLines: 3,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: T.dim, fontSize: 11)),
           ],
