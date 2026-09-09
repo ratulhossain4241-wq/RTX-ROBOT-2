@@ -42,7 +42,6 @@ class T {
   static const cyan = Color(0xFF00FFFF);
   static const dim = Color(0xFF0A6E0A);
   static const muted = Color(0xFF333333);
-  // Ghost-candle colors — UP prediction = white, DOWN prediction = gold
   static const ghostUpFill = Color(0x73FFFFFF);
   static const ghostUpBorder = Color(0xFFFFFFFF);
   static const ghostDownFill = Color(0x73F3BA2F);
@@ -74,7 +73,7 @@ const markets = <Market>[
 // ───────────────── CANDLE ─────────────────
 class Candle {
   final double o, h, l, c;
-  final String time; // raw "datetime" string from TwelveData
+  final String time;
   Candle(this.o, this.h, this.l, this.c, this.time);
   factory Candle.fromJson(Map<String, dynamic> j) => Candle(
         double.parse(j['open'].toString()),
@@ -85,23 +84,17 @@ class Candle {
       );
 }
 
-/// One AI-predicted "ghost" candle. Two of these are shown per prediction,
-/// each with its OWN direction — never forced to match each other.
 class GhostCandle {
   final double open, high, low, close;
   GhostCandle({required this.open, required this.high, required this.low, required this.close});
   bool get isUp => close >= open;
 }
 
-/// Pure technical-engine output — 11 indicators, ported 1:1 from the web
-/// app's signalEngine.js (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21,
-/// EMA21/50, RSI, Bollinger, MACD, Stochastic, Pattern). No grade/direction
-/// here — [buildFinalSignal] decides that from engine + Gemini together.
 class Signal {
-  final double strength; // 0-100, 50 = neutral, >50 leans bullish, <50 bearish
-  final int techConfidence; // 0-100, how much the 11 indicators agree with each other
-  final Map<String, String> breakdown; // every indicator's own BULL/BEAR/NEUTRAL vote
-  final Map<String, double> indicators; // every raw numeric value, sent to Gemini in full
+  final double strength;
+  final int techConfidence;
+  final Map<String, String> breakdown;
+  final Map<String, double> indicators;
   Signal({
     required this.strength,
     required this.techConfidence,
@@ -110,12 +103,10 @@ class Signal {
   });
 }
 
-/// Final, user-facing decision after combining the technical engine with Gemini.
-/// direction/grade/accuracy are ALWAYS resolved to a real CALL or PUT — never null.
 class FinalSignal {
-  final String grade; // A+, A, B+, B, C — same scale for CALL and PUT
-  final String direction; // 'CALL' or 'PUT'
-  final int accuracy; // 0-99, combined confidence score
+  final String grade;
+  final String direction;
+  final int accuracy;
   final Color color;
   final String reason;
   FinalSignal({
@@ -186,12 +177,10 @@ double? stoch(List<Candle> cs, [int p = 14]) {
   return ((cs.last.c - ll) / (hh - ll)) * 100;
 }
 
-/// 3-candle pattern read (engulfing / pin bar / reversal / 3-in-a-row).
-/// Returns -2..2. Ported 1:1 from the web app's patternScore().
 int patternScore(List<Candle> candles) {
   if (candles.length < 3) return 0;
   final last3 = candles.sublist(candles.length - 3);
-  final c2 = last3[0], c1 = last3[1], c0 = last3[2]; // oldest -> newest
+  final c2 = last3[0], c1 = last3[1], c0 = last3[2];
   bool bull(Candle c) => c.c > c.o;
   double body(Candle c) => (c.c - c.o).abs();
   final c0body = body(c0), c1body = body(c1), c2body = body(c2);
@@ -210,8 +199,7 @@ int patternScore(List<Candle> candles) {
 }
 
 // ══════════════════════════════════════════════════════════
-//   TOP-TIER INDICATORS (ADX, Supertrend, Ichimoku, Fractal2)
-//   Ported 1:1 from the web app's signalEngine.js
+//   TOP-TIER INDICATORS
 // ══════════════════════════════════════════════════════════
 
 Map<String, double>? calcADX(List<Candle> candles, [int p = 14]) {
@@ -336,8 +324,6 @@ Map<String, double>? calcIchimoku(List<Candle> candles) {
   };
 }
 
-/// Confirmed-only Williams 5-bar fractal (n=2 each side) — never repaints.
-/// Returns {'type': 1=low(bull)/-1=high(bear), 'age': candles since confirmed}.
 Map<String, double>? calcFractal2(List<Candle> candles, [int n = 2]) {
   if (candles.length < n * 2 + 1) return null;
   final highs = candles.map((c) => c.h).toList();
@@ -356,6 +342,135 @@ Map<String, double>? calcFractal2(List<Candle> candles, [int n = 2]) {
 }
 
 // ══════════════════════════════════════════════════════════
+//   NEW: ATR / SUPPORT-RESISTANCE / FVG / TREND
+//   (context Gemini needs to draw grounded, non-random candles)
+// ══════════════════════════════════════════════════════════
+
+/// Wilder ATR — used both as prompt context AND to sanity-check Gemini's
+/// output range after the fact (rejects absurdly large/small candles).
+double? calcATR(List<Candle> candles, [int period = 14]) {
+  if (candles.length < period + 1) return null;
+  final trs = <double>[];
+  for (var i = 1; i < candles.length; i++) {
+    final c = candles[i];
+    final prevClose = candles[i - 1].c;
+    trs.add([c.h - c.l, (c.h - prevClose).abs(), (c.l - prevClose).abs()].reduce(max));
+  }
+  var val = trs.sublist(0, period).reduce((a, b) => a + b) / period;
+  for (var i = period; i < trs.length; i++) {
+    val = (val * (period - 1) + trs[i]) / period;
+  }
+  return val;
+}
+
+/// Finds the nearest support (below price) and resistance (above price)
+/// from confirmed swing highs/lows over the recent lookback window,
+/// clustering nearby touches into one level so noise doesn't create
+/// dozens of near-duplicate levels.
+Map<String, double?> findSupportResistance(List<Candle> candles, {int lookback = 150, int n = 3}) {
+  final recent = candles.length > lookback ? candles.sublist(candles.length - lookback) : candles;
+  if (recent.length < n * 2 + 1) return {'support': null, 'resistance': null};
+  final price = recent.last.c;
+  final swingHighs = <double>[];
+  final swingLows = <double>[];
+  for (var i = n; i < recent.length - n; i++) {
+    final h = recent[i].h;
+    final l = recent[i].l;
+    var isHigh = true, isLow = true;
+    for (var k = 1; k <= n; k++) {
+      if (!(h > recent[i - k].h && h > recent[i + k].h)) isHigh = false;
+      if (!(l < recent[i - k].l && l < recent[i + k].l)) isLow = false;
+    }
+    if (isHigh) swingHighs.add(h);
+    if (isLow) swingLows.add(l);
+  }
+
+  // Cluster: merge levels within 0.05% of each other, keep the mean.
+  List<double> cluster(List<double> levels) {
+    if (levels.isEmpty) return [];
+    final sorted = [...levels]..sort();
+    final out = <double>[];
+    var group = <double>[sorted.first];
+    for (var i = 1; i < sorted.length; i++) {
+      if ((sorted[i] - group.last).abs() / sorted[i] < 0.0005) {
+        group.add(sorted[i]);
+      } else {
+        out.add(group.reduce((a, b) => a + b) / group.length);
+        group = [sorted[i]];
+      }
+    }
+    out.add(group.reduce((a, b) => a + b) / group.length);
+    return out;
+  }
+
+  final resLevels = cluster(swingHighs).where((v) => v > price).toList()..sort((a, b) => a.compareTo(b));
+  final supLevels = cluster(swingLows).where((v) => v < price).toList()..sort((a, b) => b.compareTo(a));
+
+  return {
+    'support': supLevels.isNotEmpty ? supLevels.first : null,
+    'resistance': resLevels.isNotEmpty ? resLevels.first : null,
+  };
+}
+
+class FVGZone {
+  final double top, bottom;
+  final bool bullish;
+  FVGZone({required this.top, required this.bottom, required this.bullish});
+}
+
+/// 3-candle Fair Value Gap detection: candle[i-2].high < candle[i].low is a
+/// bullish imbalance (candle[i-2].low > candle[i].high = bearish). Only
+/// UNFILLED gaps (price hasn't traded back through them yet) are returned —
+/// filled gaps have already done their job and no longer matter.
+List<FVGZone> detectFVG(List<Candle> candles, {int lookback = 80, int maxZones = 3}) {
+  final recent = candles.length > lookback ? candles.sublist(candles.length - lookback) : candles;
+  final zones = <MapEntry<FVGZone, int>>[];
+  for (var i = 2; i < recent.length; i++) {
+    final left = recent[i - 2];
+    final right = recent[i];
+    if (left.h < right.l) {
+      zones.add(MapEntry(FVGZone(top: right.l, bottom: left.h, bullish: true), i));
+    } else if (left.l > right.h) {
+      zones.add(MapEntry(FVGZone(top: left.l, bottom: right.h, bullish: false), i));
+    }
+  }
+  final unfilled = <FVGZone>[];
+  for (final entry in zones) {
+    final zone = entry.key;
+    final createdAt = entry.value;
+    var filled = false;
+    for (var j = createdAt + 1; j < recent.length; j++) {
+      final c = recent[j];
+      if (zone.bullish && c.l <= zone.bottom) { filled = true; break; }
+      if (!zone.bullish && c.h >= zone.top) { filled = true; break; }
+    }
+    if (!filled) unfilled.add(zone);
+  }
+  return unfilled.length > maxZones ? unfilled.sublist(unfilled.length - maxZones) : unfilled;
+}
+
+/// Simple structural trend read from EMA50 vs EMA200 (falls back to a
+/// 50-candle price comparison when there isn't 200 candles yet).
+String detectTrend(List<Candle> candles) {
+  final closes = candles.map((c) => c.c).toList();
+  final e50 = ema(closes, 50);
+  if (e50 == null) return 'UNKNOWN';
+  if (closes.length >= 200) {
+    final e200 = ema(closes, 200);
+    if (e200 != null) {
+      if (e50 > e200 * 1.0005) return 'UPTREND';
+      if (e50 < e200 * 0.9995) return 'DOWNTREND';
+      return 'SIDEWAYS';
+    }
+  }
+  final refIdx = max(0, closes.length - 50);
+  final diff = (closes.last - closes[refIdx]) / closes[refIdx];
+  if (diff > 0.001) return 'UPTREND';
+  if (diff < -0.001) return 'DOWNTREND';
+  return 'SIDEWAYS';
+}
+
+// ══════════════════════════════════════════════════════════
 //   MASTER SIGNAL ENGINE — all 11 indicators
 // ══════════════════════════════════════════════════════════
 Signal runEngine(List<Candle> candles) {
@@ -371,7 +486,6 @@ Signal runEngine(List<Candle> candles) {
   double score = 0;
   double maxScore = 0;
 
-  // 1. ADX + DI — weight 16
   final ax = calcADX(candles, 14);
   if (ax != null) {
     double v;
@@ -392,7 +506,6 @@ Signal runEngine(List<Candle> candles) {
     bd['ADX'] = '→ NEUTRAL';
   }
 
-  // 2. Supertrend — weight 16
   final st2 = calcSupertrend(candles, 10, 3);
   if (st2 != null) {
     final v = st2['trend']! == 1 ? 16.0 : -16.0;
@@ -405,7 +518,6 @@ Signal runEngine(List<Candle> candles) {
     bd['Supertrend'] = '→ NEUTRAL';
   }
 
-  // 3. Ichimoku Cloud — weight 16
   final ich = calcIchimoku(candles);
   if (ich != null) {
     double v;
@@ -432,7 +544,6 @@ Signal runEngine(List<Candle> candles) {
     bd['Ichimoku'] = '→ NEUTRAL';
   }
 
-  // 4. Fractal 2 — weight 16, decays with age; falls back to 3-candle momentum
   final fr = calcFractal2(candles, 2);
   if (fr != null) {
     final decay = max(0.0, 1 - fr['age']! * 0.15);
@@ -444,14 +555,13 @@ Signal runEngine(List<Candle> candles) {
     ind['fractal2Age'] = fr['age']!;
   } else {
     final isBullMomentum = last > closes[max(0, closes.length - 4)];
-    final v = isBullMomentum ? 8.0 : -8.0; // fallback still actually votes, half weight
+    final v = isBullMomentum ? 8.0 : -8.0;
     score += v;
     maxScore += 16;
     bd['Fractal 2'] = isBullMomentum ? '↑ BULL' : '↓ BEAR';
     ind['fractal2Type'] = 0;
   }
 
-  // 5. EMA 8/21 — weight up to 14, scaled by gap size
   final e8 = ema(closes, 8);
   final e21 = ema(closes, 21);
   if (e8 != null && e21 != null) {
@@ -467,7 +577,6 @@ Signal runEngine(List<Candle> candles) {
     bd['EMA 8/21'] = '→ NEUTRAL';
   }
 
-  // 6. EMA 21/50 — weight 12
   final e50 = ema(closes, 50);
   if (e21 != null && e50 != null) {
     final v = e21 > e50 ? 12.0 : -12.0;
@@ -479,7 +588,6 @@ Signal runEngine(List<Candle> candles) {
     bd['EMA 21/50'] = '→ NEUTRAL';
   }
 
-  // 7. RSI — weight up to 14, graduated by zone
   final r = rsi(closes, 14);
   if (r != null) {
     double v;
@@ -506,7 +614,6 @@ Signal runEngine(List<Candle> candles) {
     bd['RSI'] = '→ NEUTRAL';
   }
 
-  // 8. Bollinger Bands — weight up to 12, graduated by %B
   final b = bb(closes, 20);
   if (b != null) {
     final pct = (last - b['lower']!) / (b['upper']! - b['lower']!);
@@ -537,7 +644,6 @@ Signal runEngine(List<Candle> candles) {
     bd['Bollinger'] = '→ NEUTRAL';
   }
 
-  // 9. MACD — weight 12 (7 from line-vs-signal, 5 from histogram sign)
   final m = macd(closes);
   if (m != null) {
     final cv = m['line']! > m['signal']! ? 7.0 : -7.0;
@@ -552,7 +658,6 @@ Signal runEngine(List<Candle> candles) {
     bd['MACD'] = '→ NEUTRAL';
   }
 
-  // 10. Stochastic — weight up to 10, graduated by zone
   final st = stoch(candles, 14);
   if (st != null) {
     double v;
@@ -575,7 +680,6 @@ Signal runEngine(List<Candle> candles) {
     bd['Stoch'] = '→ NEUTRAL';
   }
 
-  // 11. Candle Pattern — weight 10
   final pat = patternScore(candles);
   ind['patternScore'] = pat.toDouble();
   if (pat != 0) {
@@ -586,7 +690,7 @@ Signal runEngine(List<Candle> candles) {
   } else {
     final lastC = candles.last;
     final isBullCandle = lastC.c > lastC.o;
-    final v = isBullCandle ? 5.0 : -5.0; // fallback still actually votes, half weight
+    final v = isBullCandle ? 5.0 : -5.0;
     score += v;
     maxScore += 10;
     bd['Pattern'] = isBullCandle ? '↑ BULL' : '↓ BEAR';
@@ -602,8 +706,6 @@ Signal runEngine(List<Candle> candles) {
   return Signal(strength: strength, techConfidence: techConfidence, breakdown: bd, indicators: ind);
 }
 
-/// Grade is purely about how CONFIDENT the final call is (0-99 accuracy),
-/// independent of CALL vs PUT — a strong PUT and a strong CALL both reach A+.
 Map<String, dynamic> gradeFromAccuracy(int accuracy, String direction) {
   String grade;
   if (accuracy >= 88) {
@@ -624,8 +726,6 @@ Map<String, dynamic> gradeFromAccuracy(int accuracy, String direction) {
   };
 }
 
-/// Combines the 11-indicator engine with Gemini's read into one final
-/// decision. ALWAYS resolves to CALL or PUT — never leaves it undecided.
 FinalSignal buildFinalSignal({
   required Signal eng,
   required bool aiOk,
@@ -660,10 +760,6 @@ FinalSignal buildFinalSignal({
 }
 
 // ───────────────── STORAGE ─────────────────
-// Main app and overlay run in two SEPARATE Flutter engines. shared_preferences
-// caches everything in memory per engine on first getInstance() and normally
-// never re-reads disk after that — reload() forces a fresh disk read every
-// time, on both sides, which is what keeps market/API keys in sync.
 class Store {
   static Future<SharedPreferences> _fresh() async {
     final p = await SharedPreferences.getInstance();
@@ -684,9 +780,11 @@ class Store {
 }
 
 // ───────────────── API ─────────────────
+// outputsize now 200 (was 80) — engine and Gemini context both benefit
+// from the deeper history, especially Ichimoku (needs 52+) and S/R.
 Future<List<Candle>> fetchCandles(String key, String symbol) async {
   final uri = Uri.parse(
-    'https://api.twelvedata.com/time_series?symbol=${Uri.encodeComponent(symbol)}&interval=1min&outputsize=80&timezone=UTC&apikey=$key',
+    'https://api.twelvedata.com/time_series?symbol=${Uri.encodeComponent(symbol)}&interval=1min&outputsize=200&timezone=UTC&apikey=$key',
   );
   final res = await http.get(uri);
   final data = jsonDecode(res.body);
@@ -699,7 +797,7 @@ Future<List<Candle>> fetchCandles(String key, String symbol) async {
   return list;
 }
 
-String _candleDump(List<Candle> candles, {int last = 30}) {
+String _candleDump(List<Candle> candles, {int last = 40}) {
   final slice = candles.length > last ? candles.sublist(candles.length - last) : candles;
   return slice
       .map((c) =>
@@ -707,24 +805,37 @@ String _candleDump(List<Candle> candles, {int last = 30}) {
       .join(';');
 }
 
-/// Every indicator's own BULL/BEAR/NEUTRAL vote — the same breakdown the
-/// engine itself uses, so Gemini sees exactly what the engine saw.
 String _voteDump(Map<String, String> bd) {
   return bd.entries.map((e) => '${e.key}:${e.value}').join(', ');
 }
 
-/// JPY pairs quote to 3 decimals, everything else to 5 — used to round
-/// the ghost candles to a sane precision for the pair being traded.
+String _fvgDump(List<FVGZone> zones, int decimals) {
+  if (zones.isEmpty) return 'none';
+  return zones
+      .map((z) =>
+          '${z.bullish ? "BULLISH" : "BEARISH"}(${z.bottom.toStringAsFixed(decimals)}-${z.top.toStringAsFixed(decimals)})')
+      .join(', ');
+}
+
 int _decimalsFor(String symbol) => symbol.toUpperCase().contains('JPY') ? 3 : 5;
 
 const _ghostSystemInstruction =
-    'You are a strict 1-minute forex candle predictor analyzing 11 technical '
-    'indicators (ADX+DI, Supertrend, Ichimoku, Fractal2, EMA8/21, EMA21/50, '
-    'RSI, Bollinger, MACD, Stochastic, Pattern).\n'
+    'You are a strict 1-minute forex candle predictor. You are given: 11 '
+    'technical indicator votes (ADX+DI, Supertrend, Ichimoku, Fractal2, '
+    'EMA8/21, EMA21/50, RSI, Bollinger, MACD, Stochastic, Pattern), the '
+    'current ATR (average true range, i.e. typical candle size), the nearest '
+    'support and resistance levels, any unfilled Fair Value Gap zones, and '
+    'the overall trend (UPTREND/DOWNTREND/SIDEWAYS).\n'
     'You predict the NEXT TWO consecutive 1-minute candles (candle 1 = next '
     'minute, candle 2 = the minute after that). The two candles are '
     'INDEPENDENT — candle 2 does not have to move the same direction as '
     'candle 1; judge each one purely on its own merits.\n'
+    'Ground your prediction in ALL the given context: respect support/'
+    'resistance as areas price may reverse or stall at, treat unfilled FVG '
+    'zones as magnets price may move toward, do not fight the stated overall '
+    'trend without a strong reason from the indicators, and keep each '
+    'candle\'s total range (high-low) realistic relative to the given ATR — '
+    'normally between 0.3x and 2.5x ATR, never wildly outside it.\n'
     'You ONLY ever output exactly one line in this exact format, nothing else:\n'
     'O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON\n'
     'O1, H1, L1, C1 are candle 1 open/high/low/close. O1 must equal the last '
@@ -733,17 +844,17 @@ const _ghostSystemInstruction =
     'C1, so do not output it). H2 must be >= max(C1,C2). L2 must be <= min(C1,C2).\n'
     'All six prices use the same number of decimal places as the input prices.\n'
     'CONFIDENCE is an integer 0-100, your confidence in candle 1.\n'
-    'REASON must be written in Bengali (বাংলা), up to about 20 words explaining '
-    'why you are confident or why the setup is risky/uncertain. No punctuation '
-    'beyond commas in REASON.\n'
+    'REASON must be written in Bengali (বাংলা), up to about 20 words, '
+    'referencing WHICH context (trend, S/R, FVG, or indicators) drove your '
+    'call. No punctuation beyond commas in REASON.\n'
     'Never add greetings, disclaimers, markdown, or extra lines beyond the one required.\n'
     'Never refuse to answer — always output definite predicted candles.';
 
-/// Predicts the next TWO ghost candles via Gemini's REST API directly
-/// (not the google_generative_ai package) so every HTTP status code and
-/// error payload can be inspected and turned into a specific Bengali
-/// message — this is what lets you actually diagnose a failure instead of
-/// just seeing a generic "AI error".
+/// Predicts the next TWO ghost candles via Gemini's REST API directly.
+/// Now includes ATR, support/resistance, FVG zones, and trend as context,
+/// and validates the response's range against ATR afterward — an
+/// out-of-bounds candle is rejected and the fallback is used instead,
+/// which is what stops "random-looking" AI candles from reaching the UI.
 Future<Map<String, dynamic>> predictGhostCandles({
   required String key,
   required String market,
@@ -752,10 +863,11 @@ Future<Map<String, dynamic>> predictGhostCandles({
 }) async {
   final lastClose = candles.last.c;
   final decimals = _decimalsFor(market);
+  final atrVal = calcATR(candles, 14) ?? (candles.last.h - candles.last.l);
+  final sr = findSupportResistance(candles);
+  final fvg = detectFVG(candles);
+  final trend = detectTrend(candles);
 
-  // Sane fallback if Gemini fails or there's no key: project two small moves
-  // off the engine's own direction, sized from recent candle ranges — the
-  // ghost candles are never left empty, and the reason always explains why.
   Map<String, dynamic> fallback(String reasonText, String errorType) {
     final recent = candles.length > 10 ? candles.sublist(candles.length - 10) : candles;
     final avgRange = recent.map((c) => c.h - c.l).reduce((a, b) => a + b) / recent.length;
@@ -787,12 +899,20 @@ Future<Map<String, dynamic>> predictGhostCandles({
     return fallback('Gemini key নেই — শুধু ইন্ডিকেটর দিয়ে অনুমান করা হলো', 'no_key');
   }
 
+  final srLine =
+      'Support: ${sr['support'] != null ? sr['support']!.toStringAsFixed(decimals) : "none nearby"}, '
+      'Resistance: ${sr['resistance'] != null ? sr['resistance']!.toStringAsFixed(decimals) : "none nearby"}';
+
   final prompt = '''
 Pair: $market
-Recent 1m candles (oldest→newest, o,h,l,c per candle, ; separated):
+Recent 1m candles (oldest→newest, o,h,l,c per candle, ; separated), from a 200-candle history:
 ${_candleDump(candles)}
 
 Last known close (this is O1, the open of candle 1): ${lastClose.toStringAsFixed(decimals)}
+Overall trend (from 200-candle history): $trend
+$srLine
+Unfilled Fair Value Gap zones: ${_fvgDump(fvg, decimals)}
+Current ATR (typical 1m candle range): ${atrVal.toStringAsFixed(decimals)}
 All 11 indicator votes: ${_voteDump(eng.breakdown)}
 Technical engine reading: strength=${eng.strength.toStringAsFixed(1)}/100, agreement=${eng.techConfidence}%
 
@@ -822,7 +942,7 @@ Respond with exactly one line: O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON
                 ]
               }
             ],
-            'generationConfig': {'temperature': 0.15, 'maxOutputTokens': 140, 'candidateCount': 1},
+            'generationConfig': {'temperature': 0.15, 'maxOutputTokens': 160, 'candidateCount': 1},
           }),
         )
         .timeout(const Duration(seconds: 15));
@@ -893,12 +1013,26 @@ Respond with exactly one line: O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON
     final confidence =
         int.tryParse(parts[7].trim().replaceAll(RegExp(r'[^0-9]'), '')) ?? 50;
     final reason = parts.sublist(8).join('|').trim();
-    final o2 = c1; // forced chain — candle 2 always opens where candle 1 closed
+    final o2 = c1;
 
     final range1Valid = h1 >= max(o1, c1) && l1 <= min(o1, c1);
     final range2Valid = h2 >= max(o2, c2) && l2 <= min(o2, c2);
     if (!range1Valid || !range2Valid) {
       return fallback('AI ভুল রেঞ্জের ক্যান্ডেল দিয়েছে, ইঞ্জিন দিয়ে অনুমান করা হলো', 'range_invalid');
+    }
+
+    // ATR sanity check — this is what actually stops "random" candles:
+    // if Gemini ignores the given ATR and outputs a candle way outside
+    // realistic size (too huge OR suspiciously flat), reject it.
+    final range1 = h1 - l1;
+    final range2 = h2 - l2;
+    final minOk = atrVal * 0.15;
+    final maxOk = atrVal * 4.0;
+    if (range1 < minOk || range1 > maxOk || range2 < minOk || range2 > maxOk) {
+      return fallback(
+        'AI-এর ক্যান্ডেল সাইজ বর্তমান ATR-এর তুলনায় অস্বাভাবিক ছিলো, ইঞ্জিন দিয়ে অনুমান করা হলো',
+        'atr_out_of_range',
+      );
     }
 
     double round(double n) => double.parse(n.toStringAsFixed(decimals));
@@ -915,7 +1049,7 @@ Respond with exactly one line: O1|H1|L1|C1|H2|L2|C2|CONFIDENCE|REASON
   }
 }
 
-// ───────────────── LAUNCH PAGE (Settings + Market + Start) ─────────────────
+// ───────────────── LAUNCH PAGE ─────────────────
 class LaunchPage extends StatefulWidget {
   const LaunchPage({super.key});
   @override
@@ -1075,8 +1209,6 @@ class _LaunchPageState extends State<LaunchPage> {
                   style: TextStyle(
                       color: perm ? T.green : T.red, fontWeight: FontWeight.bold)),
               const SizedBox(height: 20),
-
-              // ── API KEYS ──
               const Text('API KEYS',
                   style: TextStyle(color: T.gold, fontWeight: FontWeight.bold, fontSize: 13)),
               const SizedBox(height: 8),
@@ -1092,10 +1224,7 @@ class _LaunchPageState extends State<LaunchPage> {
                 onPressed: saveKeys,
                 child: const Text('SAVE KEYS', style: TextStyle(color: T.green, fontWeight: FontWeight.bold)),
               ),
-
               const SizedBox(height: 24),
-
-              // ── MARKET ──
               const Text('MARKET',
                   style: TextStyle(color: T.gold, fontWeight: FontWeight.bold, fontSize: 13)),
               const SizedBox(height: 8),
@@ -1118,7 +1247,6 @@ class _LaunchPageState extends State<LaunchPage> {
                   ),
                 ),
               ),
-
               const SizedBox(height: 28),
               SizedBox(
                 width: double.infinity,
@@ -1178,9 +1306,6 @@ class _OhlcBox {
   bool get isUp => c >= o;
 }
 
-/// Draws real candles (green/red) followed by up to 2 ghost candles
-/// (white=UP prediction, gold=DOWN prediction) with a divider between them.
-/// Each ghost candle's color is entirely independent of the other.
 class GhostCandlePainter extends CustomPainter {
   final List<Candle> realCandles;
   final GhostCandle? ghost1;
@@ -1278,9 +1403,9 @@ class _OverlayHomeState extends State<OverlayHome> {
   Market selected = markets.first;
   FinalSignal? finalSignal;
   List<Candle> candles = [];
-  List<GhostCandle>? predictedCandles; // [candle1, candle2] or null
+  List<GhostCandle>? predictedCandles;
   String predictedReason = '';
-  String lastCandleTimeLocal = ''; // UTC candle time converted to phone-local time
+  String lastCandleTimeLocal = '';
 
   @override
   void initState() {
@@ -1558,7 +1683,7 @@ class _OverlayHomeState extends State<OverlayHome> {
       return Padding(
         padding: const EdgeInsets.all(14),
         child: Text(
-          predicting ? 'Gemini ভাবছে (২টা ঘোস্ট ক্যান্ডেল)...' : 'SCANNING ${selected.name} (11 indicators)...',
+          predicting ? 'Gemini ভাবছে (২০০ ক্যান্ডেল, S/R, FVG সহ)...' : 'SCANNING ${selected.name} (200 candles)...',
           textAlign: TextAlign.center,
           style: const TextStyle(color: T.green, fontWeight: FontWeight.bold, fontSize: 13),
         ),
